@@ -143,7 +143,7 @@ class Audio(MumbleRunner):
         pa = pyaudio.PyAudio()
         pulse = None
         input_device_names, output_device_names = self.__scan_devices(pa)
-        chunk_size = int(pymumble.constants.PYMUMBLE_SAMPLERATE * self.config["args"].packet_length)
+        chunk_size = int(pymumble.constants.PYMUMBLE_SAMPLERATE * self.config["args"]["packet_length"])
         # Output audio
         if pulse is None and self.config["output_pulse_name"]:
             pulse = PulseAudioHandler("mumblestream")
@@ -326,59 +326,105 @@ def get_config(args):
     else:
         configdata = {}
 
+    config["args"] = {}
+    config["args"]["host"] = configdata.get("host", None) # Mandatory
+    config["args"]["user"] = configdata.get("user", None) # Mandatory
+    config["args"]["password"] = configdata.get("password", "")
+    config["args"]["packet_length"] = configdata.get("packet_length", pymumble.constants.PYMUMBLE_AUDIO_PER_PACKET)
+    config["args"]["bandwidth"] = configdata.get("bandwidth", 48000)
+    config["args"]["certfile"] = configdata.get("certfile", None)
+    config["args"]["channel"] = configdata.get("channel", None)
+    config["args"]["fifo_path"] = configdata.get("fifo_path", None)
+
     config["output_pyaudio_name"] = configdata.get("output_pyaudio_name", "default")
     config["output_pulse_name"] = configdata.get("output_pulse_name")
     config["ptt_on_command"] = configdata.get("ptt_on_command")
     config["ptt_off_command"] = configdata.get("ptt_off_command")
     config["ptt_command_support"] = not (config["ptt_on_command"] is None or config["ptt_off_command"] is None)
     config["logging_level"] = configdata.get("logging_level", "warning")
+
+    args_dict = vars(args)
+    for key in args_dict:
+        if args_dict[key] is not None:
+            config["args"][key] = args_dict[key]
+
+    if config["logging_level"] == "debug":
+        print("Configuration: %s" % config)
+
     return config
+
+def validate_config(config):
+    is_valid = True
+    errors = []
+
+    if "args" in config and config["args"] is not None:
+        args = config["args"]
+
+        if "host" not in args or args["host"] is None:
+            errors.append("No host parameter")
+            is_valid = False
+
+        if "user" not in args or args["user"] is None:
+            errors.append("No user parameter")
+            is_valid = False
+    else:
+        errors.append("No args object")
+        is_valid = False
+
+    return (is_valid, errors)
 
 
 def main(preserve_thread=True):
     """swallows parameter. TODO: move functionality away"""
     parser = argparse.ArgumentParser(description="Alsa input to mumble")
     # fmt: off
-    parser.add_argument("-H", "--host", dest="host", type=str, required=True,
+    parser.add_argument("-H", "--host", dest="host", type=str,
                         help="A hostame of a mumble server")
-    parser.add_argument("-u", "--user", dest="user", type=str, required=True,
+    parser.add_argument("-u", "--user", dest="user", type=str,
                         help="Username you wish, Default=mumble")
-    parser.add_argument("-p", "--password", dest="password", type=str, default="",
+    parser.add_argument("-p", "--password", dest="password", type=str,
                         help="Password if server requires one")
-    parser.add_argument("-s", "--setpacketlength", dest="packet_length", type=int, default=pymumble.constants.PYMUMBLE_AUDIO_PER_PACKET,
+    parser.add_argument("-s", "--setpacketlength", dest="packet_length", type=int,
                         help="Length of audio packet in seconds. Lower values mean less delay. Default 0.02 WARNING:Lower values could be unstable")
-    parser.add_argument("-b", "--bandwidth", dest="bandwidth", type=int, default=48000,
-                        help="Bandwith of the bot (in bytes/s). Default=96000")
-    parser.add_argument("-c", "--certificate", dest="certfile", type=str, default=None,
+    parser.add_argument("-b", "--bandwidth", dest="bandwidth", type=int,
+                        help="Bandwith of the bot (in bytes/s). Default=48000")
+    parser.add_argument("-c", "--certificate", dest="certfile", type=str,
                         help="Path to an optional openssl certificate file")
-    parser.add_argument("-C", "--channel", dest="channel", type=str, default=None,
+    parser.add_argument("-C", "--channel", dest="channel", type=str,
                         help="Channel name as string")
-    parser.add_argument("-f", "--fifo", dest="fifo_path", type=str, default=None,
+    parser.add_argument("-f", "--fifo", dest="fifo_path", type=str,
                         help="Read from FIFO (EXPERMENTAL)")
     parser.add_argument("--config", dest="config_path", type=str, default="listener.json",
                         help="Configuration file")
     # fmt: on
     args = parser.parse_args()
     config = get_config(args)
-    config["args"] = args
+    #config["args"] = args
+
+    config_is_valid, config_errors = validate_config(config)
+    if not config_is_valid:
+        print("Configuration errors:")
+        for error in config_errors:
+            print("    * %s" % error)
+        return
 
     log_level = logging.getLevelName(config["logging_level"].upper())
     LOG.setLevel(log_level)
 
-    mumble = prepare_mumble(args.host, args.user, args.password, args.certfile, "audio", args.bandwidth, args.channel)
+    mumble = prepare_mumble(config["args"]["host"], config["args"]["user"], config["args"]["password"], config["args"]["certfile"], "audio", config["args"]["bandwidth"], config["args"]["channel"])
 
     if mumble is None:
         LOG.critical("cannot connect to Mumble server or channel")
         return 1
 
     # fmt: off
-    if args.fifo_path:
+    if config["args"]["fifo_path"]:
         audio = AudioPipe(
             mumble,
             config,
             {
                 "output": {
-                    "args": (args.packet_length,),
+                    "args": (config["args"]["packet_length"],),
                     "kwargs": None
                 },
                 "ptt": {
