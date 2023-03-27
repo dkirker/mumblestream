@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 """
 TITLE:  mumblestream
 AUTHOR: Ranomier (ranomier@fragomat.net), F4EXB (f4exb06@gmail.com)
@@ -14,6 +14,17 @@ import time
 import logging
 import json
 import collections
+
+from ctypes import *
+import time
+#import threading
+import select
+import socket
+import errno
+import struct
+import ctypes
+
+import audioop
 
 import pymumble_py3 as pymumble
 from pymumble_py3.callbacks import PYMUMBLE_CLBK_SOUNDRECEIVED as CLBK_SOUNDRECEIVED
@@ -318,13 +329,13 @@ class Audio(MumbleRunner):
         self.in_running = True
         try:
             while self.in_running:
-                data = self.stream_in.read(chunk_size)
+                data = self.stream_in.read(chunk_size, exception_on_overflow = False)
                 if self.__level(data) > self.config["audio_threshold"]:
                     LOG.debug("audio on")
                     quiet_samples = 0
-                    while quiet_samples < (self.config["vox_silence_time"] * (1 / self.config["args"].packet_length)):
+                    while quiet_samples < (self.config["vox_silence_time"] * (1 / self.config["args"]["packet_length"])):
                         self.mumble.sound_output.add_sound(data)
-                        data = self.stream_in.read(chunk_size)
+                        data = self.stream_in.read(chunk_size, exception_on_overflow = False)
                         if self.__level(data) < self.config["audio_threshold"]:
                             quiet_samples = quiet_samples + 1
                         else:
@@ -371,17 +382,262 @@ class AudioPipe(MumbleRunner):
             with open(path) as fifo_fd:
                 while True:
                     data = fifo_fd.read(ckunk_size)
-                    self.mumble.sound_output.add_sound(data)
+                    #self.mumble.sound_output.add_sound(data)
+                    if self.__level(data) > self.config["audio_threshold"]:
+                        LOG.debug("audio on")
+                        quiet_samples = 0
+                        while quiet_samples < (self.config["vox_silence_time"] * (1 / self.config["args"]["packet_length"])):
+                            self.mumble.sound_output.add_sound(data)
+                            data = fifo_fd.read(ckunk_size)
+                            if self.__level(data) < self.config["audio_threshold"]:
+                                quiet_samples = quiet_samples + 1
+                            else:
+                                quiet_samples = 0
+                        LOG.debug("audio off")
+
 
     def stop(self, name=""):
         """Stop the runnin threads"""
 
+MAX_SUPERFRAME_SIZE = 320   # maximum size of incoming UDP audio buffer
 
-def prepare_mumble(host, user, password="", certfile=None, codec_profile="audio", bandwidth=96000, channel=None):
+# A lot of this code is from op25's audio.py and sockaudio.py
+class AudioUdp(MumbleRunner):
+    """Audio UDP stream"""
+
+    def _config(self):
+        """Initial configuration"""
+        # fmt: off
+        return {
+            "input": {
+                "func": self.__input_loop,
+                "process": None
+            },
+            "output": {
+                "func": self.__output_loop,
+                "process": None
+            }
+        }
+        # fmt: on
+
+    def __output_loop(self):
+        """Output process"""
+        return None
+
+    def __input_loop(self):
+        """Input process"""
+        chunk_size = int(pymumble.constants.PYMUMBLE_SAMPLERATE * self.config["args"]["packet_length"])
+
+        self.ratecv_state = None
+        self.audio_buffer = bytearray()
+        self.two_channels = self.config["input_udp_two_channels"]
+
+        self.__setup_sockets(self.config["input_udp_host"], self.config["input_udp_port"], self.config["input_udp_multicast"])
+
+        while True:
+            data = self.__read(chunk_size)
+            #self.mumble.sound_output.add_sound(data)
+            if self.__level(data) > self.config["audio_threshold"]:
+                LOG.debug("audio on")
+                quiet_samples = 0
+                while quiet_samples < (self.config["vox_silence_time"] * (1 / self.config["args"]["packet_length"])):
+                    self.mumble.sound_output.add_sound(data)
+                    data = self.__read(chunk_size)
+                    if self.__level(data) < self.config["audio_threshold"]:
+                        quiet_samples = quiet_samples + 1
+                    else:
+                        quiet_samples = 0
+                LOG.debug("audio off")
+
+    def __read_test(self, read_size):
+        data = bytearray()
+
+        while len(data) < read_size:
+            data_chunk = self.__read_one()
+            if len(data_chunk) > 0:
+                data = data + data_chunk
+
+        return data
+
+    def __read_two(self, read_size):
+        data, address = self.sock_a.recvfrom(read_size) #MAX_SUPERFRAME_SIZE)
+        #return self.__interleave(data, data)
+        #return bytearray(data)
+        return data
+
+    def __read(self, read_size):
+        data = self.__read_one()
+        #data = bytearray()
+
+        #LOG.debug("read_size %d" % read_size)
+
+        #while len(data) < read_size:
+        #    LOG.debug("len(data) %d" % len(data))
+        #    data_chunk = self.__read_one()
+        #    if len(data_chunk) > 0:
+        #        data.extend(data_chunk)
+        ##        data = data + data_chunk
+
+        if len(data) > 0:
+            channels = 2 # if self.two_channels else 1
+            new_data, self.ratecv_state = audioop.ratecv(data, 2, channels, 16000, 48000, self.ratecv_state)
+        else:
+            new_data = data
+
+        return new_data
+
+    def __read_one(self):
+        out_data = bytearray()
+        readable, writable, exceptional = select.select( [self.sock_a, self.sock_b], [], [self.sock_a, self.sock_b], 5.0)
+        in_a = None
+        in_b = None
+        data_a = bytearray()
+        data_b = bytearray()
+        flag_a = -1
+        flag_b = -1
+
+        # Check for select() polling timeout
+        if (not readable) and (not writable) and (not exceptional):
+            return out_data
+
+        # Data received on the udp port is 320 bytes for an audio frame or 2 bytes for a flag
+        if self.sock_a in readable:
+            in_a = self.sock_a.recvfrom(MAX_SUPERFRAME_SIZE)
+
+        if self.sock_b in readable:
+            in_b = self.sock_b.recvfrom(MAX_SUPERFRAME_SIZE)
+
+        if in_a is not None:
+            len_a = len(in_a[0])
+            if len_a == 2:
+                flag_a = np.frombuffer(in_a[0], dtype=np.int16)[0]
+            elif len_a > 0:
+                data_a = in_a[0]
+
+        if in_b is not None:
+            len_b = len(in_b[0])
+            if len_b == 2:
+                flag_b = np.frombuffer(in_b[0], dtype=np.int16)[0]
+            elif len_b > 0:
+                data_b = in_b[0]
+
+        if (flag_a == 0) or (flag_b == 0):
+            return out_data
+
+        if (((flag_a == 1) and (flag_b == 1)) or
+            ((flag_a == 1) and (in_b is None)) or
+            ((flag_b == 1) and (in_a is None))):
+            return out_data
+
+        gain = float(self.config["input_udp_audio_gain"])
+        if not self.two_channels:
+            data_a = self.__scale(gain, data_a)
+            out_data = self.__interleave(data_a, data_a)
+        else:
+            data_a = self.__scale(gain, data_a)
+            data_b = self.__scale(gain, data_b)
+            out_data = self.__interleave(data_a, data_b)
+
+        return out_data
+
+    def __setup_sockets(self, udp_host, udp_port, multicast):
+        LOG.debug("Listening on %s:%d\n" % (udp_host, udp_port))
+        self.sock_a = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.sock_a.setblocking(0)
+        self.sock_b.setblocking(0)
+
+        if multicast:
+            ##self.sock_a.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            ##self.sock_b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock_a.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            self.sock_b.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+
+            membership = struct.pack("4sl", socket.inet_aton(udp_host), socket.INADDR_ANY)
+            self.sock_a.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+            self.sock_b.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, membership)
+
+        self.sock_a.bind((udp_host, udp_port))
+        self.sock_b.bind((udp_host, udp_port + 2))
+
+    def __close_sockets(self):
+        if self.sock_a is not None:
+            self.sock_a.close()
+        if self.sock_b is not None:
+            self.sock_b.close()
+        return
+
+    @staticmethod
+    def __level(audio_bytes):
+        """Return maximum signal chunk magnitude"""
+        if len(audio_bytes) == 0:
+            return 0
+
+        alldata = bytearray()
+        alldata.extend(audio_bytes)
+        data = np.frombuffer(alldata, dtype=np.short)
+        return max(abs(data))
+
+    def __scale(self, gain, data):  # crude amplitude scaler (volume) for S16_LE samples
+        arr = np.array(np.frombuffer(data, dtype=np.int16), dtype=np.float32)
+        result = np.zeros(len(arr), dtype=np.int16)
+        arr = np.clip(arr*gain, -32767, 32766, out=result)
+        return result.tobytes('C')
+
+    def __interleave(self, data_a, data_b):
+        arr_a = np.frombuffer(data_a, dtype=np.int16)
+        arr_b = np.frombuffer(data_b, dtype=np.int16)
+        d_len = max(len(arr_a), len(arr_b))
+        result = np.zeros(d_len*2, dtype=np.int16)
+        if len(arr_a):
+            # copy arr_a to result[0,2,4, ...]
+            result[ range(0, len(arr_a)*2, 2) ] = arr_a
+        if len(arr_b):
+            # copy arr_b to result[1,3,5, ...]
+            result[ range(1, len(arr_b)*2, 2) ] = arr_b
+        return result.tobytes('C')
+
+    def stop(self, name=""):
+        """Stop the runnin threads"""
+        self.__close_sockets()
+
+class IcecastMetadataReceiver(MumbleRunner):
+    """Icecast Metadata Receiver"""
+
+    def _config(self):
+        """Initial configuration"""
+        # fmt: off
+        return {
+            "input": {
+                "func": self.__input_loop,
+                "process": None
+            },
+            "output": {
+                "func": self.__output_loop,
+                "process": None
+            }
+        }
+        # fmt: on
+
+    def __output_loop(self, _):
+        """Output process"""
+        return None
+
+    def __input_loop(self, bind_ip, bind_port):
+        """Input process"""
+        # Bind to bind_ip:bind_port
+        # Receive input
+        # Update Mumble user comment
+        # Forward to icecast_metadata_fwd_url_base if receive data
+
+    def stop(self, name=""):
+        """Stop the runnin threads"""
+
+def prepare_mumble(host, port, user, password="", certfile=None, keyfile=None, codec_profile="audio", bandwidth=96000, channel=None, debug=False):
     """Will configure the pymumble object and return it"""
 
     try:
-        mumble = pymumble.Mumble(host, user, certfile=certfile, password=password)
+        mumble = pymumble.Mumble(host, user, port=port, certfile=certfile, keyfile=keyfile, password=password, debug=debug)
     except Exception as ex:
         LOG.error("cannot commect to %s: %s", host, ex)
         return None
@@ -415,11 +671,13 @@ def get_config(args):
 
     config["args"] = {}
     config["args"]["host"] = configdata.get("host", None) # Mandatory
+    config["args"]["port"] = configdata.get("port", 64738)
     config["args"]["user"] = configdata.get("user", None) # Mandatory
     config["args"]["password"] = configdata.get("password", "")
     config["args"]["packet_length"] = configdata.get("packet_length", pymumble.constants.PYMUMBLE_AUDIO_PER_PACKET)
     config["args"]["bandwidth"] = configdata.get("bandwidth", 48000)
     config["args"]["certfile"] = configdata.get("certfile", None)
+    config["args"]["keyfile"] = configdata.get("keyfile", None)
     config["args"]["channel"] = configdata.get("channel", None)
     config["args"]["fifo_path"] = configdata.get("fifo_path", None)
 
@@ -430,13 +688,25 @@ def get_config(args):
     config["input_pyaudio_name"] = configdata.get("input_pyaudio_name", "default")
     config["input_pulse_name"] = configdata.get("input_pulse_name")
     config["input_disable"] = configdata.get("input_disable", 0) != 0
+    config["input_udp"] = configdata.get("input_udp", False)
+    config["input_udp_host"] = configdata.get("input_udp_host", "0.0.0.0")
+    config["input_udp_port"] = configdata.get("input_udp_port", 10000)
+    config["input_udp_multicast"] = configdata.get("input_udp_multicast", False)
+    config["input_udp_two_channels"] = configdata.get("input_udp_two_channels", False)
+    config["input_udp_audio_gain"] = configdata.get("input_udp_audio_gain", 1.0)
+
     config["output_pyaudio_name"] = configdata.get("output_pyaudio_name", "default")
     config["output_pulse_name"] = configdata.get("output_pulse_name")
     config["output_disable"] = configdata.get("output_disable", 0) != 0
     config["ptt_on_command"] = configdata.get("ptt_on_command")
     config["ptt_off_command"] = configdata.get("ptt_off_command")
     config["ptt_command_support"] = not (config["ptt_on_command"] is None or config["ptt_off_command"] is None)
+    config["icecast_metadata_support"] = configdata.get("icecast_metadata_support", False)
+    config["icecast_metadata_bind_ip"] = configdata.get("icecast_metadata_bind_ip", "127.0.0.1")
+    config["icecast_metadata_bind_port"] = configdata.get("icecast_metadata_bind_port", 8080)
+    config["icecast_metadata_fwd_url_base"] = configdata.get("icecast_metadata_fwd_url_base", None)
     config["logging_level"] = configdata.get("logging_level", "warning")
+    config["debug_mumble"] = configdata.get("debug_mumble", False)
 
     args_dict = vars(args)
     for key in args_dict:
@@ -475,6 +745,8 @@ def main(preserve_thread=True):
     # fmt: off
     parser.add_argument("-H", "--host", dest="host", type=str,
                         help="A hostame of a mumble server")
+    parser.add_argument("-P", "--port", dest="port", type=int,
+                        help="A port of a mumble server")
     parser.add_argument("-u", "--user", dest="user", type=str,
                         help="Username you wish, Default=mumble")
     parser.add_argument("-p", "--password", dest="password", type=str,
@@ -485,6 +757,8 @@ def main(preserve_thread=True):
                         help="Bandwith of the bot (in bytes/s). Default=48000")
     parser.add_argument("-c", "--certificate", dest="certfile", type=str,
                         help="Path to an optional openssl certificate file")
+    parser.add_argument("-k", "--key", dest="keyfile", type=str,
+                        help="Path to an optional openssl key file")
     parser.add_argument("-C", "--channel", dest="channel", type=str,
                         help="Channel name as string")
     parser.add_argument("-f", "--fifo", dest="fifo_path", type=str,
@@ -506,11 +780,32 @@ def main(preserve_thread=True):
     log_level = logging.getLevelName(config["logging_level"].upper())
     LOG.setLevel(log_level)
 
-    mumble = prepare_mumble(config["args"]["host"], config["args"]["user"], config["args"]["password"], config["args"]["certfile"], "audio", config["args"]["bandwidth"], config["args"]["channel"])
+    mumble = prepare_mumble(config["args"]["host"], config["args"]["port"], config["args"]["user"], config["args"]["password"], config["args"]["certfile"], config["args"]["keyfile"], "audio", config["args"]["bandwidth"], config["args"]["channel"], config["debug_mumble"])
 
     if mumble is None:
         LOG.critical("cannot connect to Mumble server or channel")
         return 1
+
+    # fmt: off
+    if config["icecast_metadata_support"]:
+        icecast_receiver = IcecastMetadataReceiver(
+            mumble,
+            config,
+            {
+                "output": {
+                    "args": (),
+                    "kwargs": None
+                },
+                "input": {
+                    "args": (config["args"]["icecast_metadata_bind_ip"], config["args"]["icecast_metadata_bind_port"]),
+                    "kwargs": None
+                },
+
+            },
+        )
+
+
+    # fmt: on
 
     # fmt: off
     if config["args"]["fifo_path"]:
@@ -528,6 +823,22 @@ def main(preserve_thread=True):
                 },
             },
         )
+    elif config["input_udp"]:
+        audio = AudioUdp(
+            mumble,
+            config,
+            {
+                "output": {
+                    "args": [],
+                    "kwargs": None
+                },
+                "input": {
+                    "args": [],
+                    "kwargs": None
+                },
+            },
+        )
+
     else:
         audio = Audio(
             mumble,
