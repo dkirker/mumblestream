@@ -23,6 +23,7 @@ import socket
 import errno
 import struct
 import ctypes
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 
 import audioop
 
@@ -38,6 +39,7 @@ __version__ = "0.1.0"
 logging.basicConfig(format="%(asctime)s %(levelname).1s [%(threadName)s] %(funcName)s: %(message)s", level=logging.INFO)
 LOG = logging.getLogger("Mumblestream")
 
+global_mumble = None
 
 class Status(collections.UserList):
     """Thread status handler"""
@@ -601,6 +603,15 @@ class AudioUdp(MumbleRunner):
         """Stop the runnin threads"""
         self.__close_sockets()
 
+class HttpHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type','text/html')
+        self.end_headers()
+        self.wfile.write(bytes("", "utf8"))
+
+        LOG.info("Metadata update: %s" % self.path)
+
 class IcecastMetadataReceiver(MumbleRunner):
     """Icecast Metadata Receiver"""
 
@@ -608,30 +619,37 @@ class IcecastMetadataReceiver(MumbleRunner):
         """Initial configuration"""
         # fmt: off
         return {
-            "input": {
+            "icecast_input": {
                 "func": self.__input_loop,
                 "process": None
-            },
-            "output": {
-                "func": self.__output_loop,
-                "process": None
             }
+            #,
+            #"output": {
+            #    "func": self.__output_loop,
+            #    "process": None
+            #}
         }
         # fmt: on
 
-    def __output_loop(self, _):
+    def __output_loop(self):
         """Output process"""
         return None
 
-    def __input_loop(self, bind_ip, bind_port):
+    def __input_loop(self):
         """Input process"""
         # Bind to bind_ip:bind_port
         # Receive input
         # Update Mumble user comment
         # Forward to icecast_metadata_fwd_url_base if receive data
 
+        self.meta_server = ThreadingHTTPServer((self.config["icecast_metadata_bind_ip"], self.config["icecast_metadata_bind_port"]), HttpHandler)
+        self.meta_server.serve_forever()
+
     def stop(self, name=""):
         """Stop the runnin threads"""
+
+        self.meta_server.server_close()
+
 
 def prepare_mumble(host, port, user, password="", certfile=None, keyfile=None, codec_profile="audio", bandwidth=96000, channel=None, debug=False):
     """Will configure the pymumble object and return it"""
@@ -703,7 +721,8 @@ def get_config(args):
     config["ptt_command_support"] = not (config["ptt_on_command"] is None or config["ptt_off_command"] is None)
     config["icecast_metadata_support"] = configdata.get("icecast_metadata_support", False)
     config["icecast_metadata_bind_ip"] = configdata.get("icecast_metadata_bind_ip", "127.0.0.1")
-    config["icecast_metadata_bind_port"] = configdata.get("icecast_metadata_bind_port", 8080)
+    config["icecast_metadata_bind_port"] = configdata.get("icecast_metadata_bind_port", 8888)
+    config["icecast_metadata_password"] = configdata.get("icecast_metadata_password", None)
     config["icecast_metadata_fwd_url_base"] = configdata.get("icecast_metadata_fwd_url_base", None)
     config["logging_level"] = configdata.get("logging_level", "warning")
     config["debug_mumble"] = configdata.get("debug_mumble", False)
@@ -780,11 +799,20 @@ def main(preserve_thread=True):
     log_level = logging.getLevelName(config["logging_level"].upper())
     LOG.setLevel(log_level)
 
-    mumble = prepare_mumble(config["args"]["host"], config["args"]["port"], config["args"]["user"], config["args"]["password"], config["args"]["certfile"], config["args"]["keyfile"], "audio", config["args"]["bandwidth"], config["args"]["channel"], config["debug_mumble"])
+    config_args = config["args"]
+    # fmt: off
+    mumble = prepare_mumble(
+            config_args["host"], config_args["port"],
+            config_args["user"], config_args["password"],
+            config_args["certfile"], config_args["keyfile"],
+            "audio", config_args["bandwidth"], config_args["channel"], config["debug_mumble"])
+    # fmt: on
 
     if mumble is None:
         LOG.critical("cannot connect to Mumble server or channel")
         return 1
+
+    global_mumble = mumble
 
     # fmt: off
     if config["icecast_metadata_support"]:
@@ -792,15 +820,15 @@ def main(preserve_thread=True):
             mumble,
             config,
             {
-                "output": {
+                "icecast_input": {
                     "args": (),
                     "kwargs": None
-                },
-                "input": {
-                    "args": (config["args"]["icecast_metadata_bind_ip"], config["args"]["icecast_metadata_bind_port"]),
-                    "kwargs": None
-                },
-
+                }
+                #,
+                #"icecast_output": {
+                #    "args": (),
+                #    "kwargs": None
+                #}
             },
         )
 
@@ -859,6 +887,8 @@ def main(preserve_thread=True):
         while True:
             try:
                 LOG.info(audio.status())
+                if config["icecast_metadata_support"]:
+                    LOG.info(icecast_receiver.status())
                 time.sleep(60)
             except KeyboardInterrupt:
                 LOG.info("terminating")
