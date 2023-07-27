@@ -24,6 +24,7 @@ import errno
 import struct
 import ctypes
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+import urllib.parse as url
 
 import audioop
 
@@ -39,7 +40,6 @@ __version__ = "0.1.0"
 logging.basicConfig(format="%(asctime)s %(levelname).1s [%(threadName)s] %(funcName)s: %(message)s", level=logging.INFO)
 LOG = logging.getLogger("Mumblestream")
 
-global_mumble = None
 
 class Status(collections.UserList):
     """Thread status handler"""
@@ -604,13 +604,29 @@ class AudioUdp(MumbleRunner):
         self.__close_sockets()
 
 class HttpHandler(BaseHTTPRequestHandler):
+
+    def __init__(self, mumble, *args, **kwargs):
+        self.mumble = mumble
+        super(HttpHandler, self).__init__(*args, **kwargs)
+
     def do_GET(self):
         self.send_response(200)
         self.send_header('Content-type','text/html')
+        self.send_header('Content-length','0')
         self.end_headers()
         self.wfile.write(bytes("", "utf8"))
 
         LOG.info("Metadata update: %s" % self.path)
+
+        urldata = url.urlparse(self.path)
+        params = url.parse_qs(urldata.query)
+
+        if "mode" in params and params["mode"][0] == "updinfo" and "song" in params:
+            extData = "MUMLA-EXT:" + params["song"][0]
+
+            LOG.info("Sending extData: %s" % extData)
+
+            self.mumble.users.myself.comment(extData)
 
 class IcecastMetadataReceiver(MumbleRunner):
     """Icecast Metadata Receiver"""
@@ -642,7 +658,7 @@ class IcecastMetadataReceiver(MumbleRunner):
         # Update Mumble user comment
         # Forward to icecast_metadata_fwd_url_base if receive data
 
-        self.meta_server = ThreadingHTTPServer((self.config["icecast_metadata_bind_ip"], self.config["icecast_metadata_bind_port"]), HttpHandler)
+        self.meta_server = ThreadingHTTPServer((self.config["icecast_metadata_bind_ip"], self.config["icecast_metadata_bind_port"]), lambda *args, **kwargs : HttpHandler(self.mumble, *args, **kwargs))
         self.meta_server.serve_forever()
 
     def stop(self, name=""):
@@ -812,7 +828,6 @@ def main(preserve_thread=True):
         LOG.critical("cannot connect to Mumble server or channel")
         return 1
 
-    global_mumble = mumble
 
     # fmt: off
     if config["icecast_metadata_support"]:
